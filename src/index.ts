@@ -1,6 +1,7 @@
 import { BlockTag, TransactionReceipt, TransactionRequest } from '@ethersproject/abstract-provider'
 import { Networkish } from '@ethersproject/networks'
-import { BaseProvider } from '@ethersproject/providers'
+import { BaseProvider, TransactionResponse } from '@ethersproject/providers'
+import { BlockWithTransactions } from '@ethersproject/abstract-provider'
 import { ConnectionInfo, fetchJson } from '@ethersproject/web'
 import { BigNumber, ethers, providers, Signer } from 'ethers'
 import { id, keccak256 } from 'ethers/lib/utils'
@@ -18,7 +19,7 @@ export enum FlashbotsBundleResolution {
 
 export enum FlashbotsTransactionResolution {
   TransactionIncluded,
-  TransactionDropped,
+  TransactionDropped
 }
 
 export enum FlashbotsBundleConflictType {
@@ -196,6 +197,11 @@ export interface FlashbotsBundleConflictWithGasPricing extends FlashbotsBundleCo
   conflictingBundleGasPricing?: FlashbotsGasPricing
 }
 
+export interface FlashbotsTransactionConflictWithGasPricing extends FlashbotsTransactionConflict {
+  targetBundleGasPricing: FlashbotsGasPricing
+  conflictingBundleGasPricing?: FlashbotsGasPricing
+}
+
 type RpcParams = Array<string[] | string | number | Record<string, unknown>>
 
 const TIMEOUT_MS = 5 * 60 * 1000
@@ -345,12 +351,12 @@ export class FlashbotsBundleProvider extends providers.JsonRpcProvider {
   public async sendPrivateTransaction(
     transaction: FlashbotsBundleTransaction | FlashbotsBundleRawTransaction,
     opts?: {
-      maxBlockNumber?: number,
-      simulationTimestamp?: number,
-    },
+      maxBlockNumber?: number
+      simulationTimestamp?: number
+    }
   ): Promise<FlashbotsPrivateTransaction> {
-    let signedTransaction: string;
-    if ("signedTransaction" in transaction) {
+    let signedTransaction: string
+    if ('signedTransaction' in transaction) {
       signedTransaction = transaction.signedTransaction
     } else {
       signedTransaction = await transaction.signer.signTransaction(transaction.transaction)
@@ -358,7 +364,7 @@ export class FlashbotsBundleProvider extends providers.JsonRpcProvider {
     const startBlockNumberPromise = this.genericProvider.getBlockNumber()
     const params = {
       tx: signedTransaction,
-      maxBlockNumber: opts?.maxBlockNumber,
+      maxBlockNumber: opts?.maxBlockNumber
     }
     const request = JSON.stringify(this.prepareRelayRequest('eth_sendPrivateTransaction', [params]))
     const response = await this.request(request)
@@ -375,28 +381,22 @@ export class FlashbotsBundleProvider extends providers.JsonRpcProvider {
     const privateTransaction = {
       signedTransaction: signedTransaction,
       hash: ethers.utils.keccak256(signedTransaction),
-      account: transactionDetails.from || "0x0",
-      nonce: transactionDetails.nonce,
+      account: transactionDetails.from || '0x0',
+      nonce: transactionDetails.nonce
     }
     const startBlockNumber = await startBlockNumberPromise
 
     return {
       transaction: privateTransaction,
       wait: () => this.waitForTxInclusion(privateTransaction.hash, opts?.maxBlockNumber || startBlockNumber + 25, TIMEOUT_MS),
-      simulate: () =>
-        this.simulate(
-          [privateTransaction.signedTransaction],
-          startBlockNumber,
-          undefined,
-          opts?.simulationTimestamp,
-        ),
-      receipts: () => this.fetchReceipts([privateTransaction]),
+      simulate: () => this.simulate([privateTransaction.signedTransaction], startBlockNumber, undefined, opts?.simulationTimestamp),
+      receipts: () => this.fetchReceipts([privateTransaction])
     }
   }
 
   public async cancelPrivateTransaction(txHash: string): Promise<boolean | RelayResponseError> {
     const params = {
-      txHash,
+      txHash
     }
     const request = JSON.stringify(this.prepareRelayRequest('eth_cancelPrivateTransaction', [params]))
     const response = await this.request(request)
@@ -409,7 +409,7 @@ export class FlashbotsBundleProvider extends providers.JsonRpcProvider {
       }
     }
 
-    return true;
+    return true
   }
 
   public async signBundle(bundledTransactions: Array<FlashbotsBundleTransaction | FlashbotsBundleRawTransaction>): Promise<Array<string>> {
@@ -710,6 +710,108 @@ export class FlashbotsBundleProvider extends providers.JsonRpcProvider {
     }
   }
 
+  // public async getConflictingNonFlashbotsBundle(
+  //   targetSignedBundledTransactions: Array<string>,
+  //   targetBlockNumber: number
+  // ): Promise<FlashbotsTransactionConflictWithGasPricing> {
+  //   const baseFee = (await this.genericProvider.getBlock(targetBlockNumber)).baseFeePerGas || BigNumber.from(0)
+  //   const conflictDetails = await this.getConflictingNonFlashbotsBundleWithoutGasPricing(targetSignedBundledTransactions, targetBlockNumber)
+  //   return {
+  //     ...conflictDetails,
+  //     targetBundleGasPricing: this.calculateBundlePricing(conflictDetails.initialSimulation.results, baseFee),
+  //     conflictingBundleGasPricing:
+  //       conflictDetails.conflictingBundle.length > 0 ? this.calculateBundlePricing(conflictDetails.conflictingBundle, baseFee) : undefined
+  //   }
+  // }
+
+  public async getConflictingNonFlashbotsBundleWithoutGasPricing(
+    targetSignedBundledTransactions: Array<string>,
+    targetBlockNumber: number
+  ): Promise<FlashbotsTransactionConflict> {
+    const [initialSimulation, competingBundles] = await Promise.all([
+      this.simulate(targetSignedBundledTransactions, targetBlockNumber, targetBlockNumber - 1),
+      this.fetchBlocks(targetBlockNumber)
+    ])
+    const bundleTransactions = competingBundles.transactions
+    const bundleCount = bundleTransactions.length
+    const signedPriorBundleTransactions = []
+    if ('error' in initialSimulation || initialSimulation.firstRevert !== undefined) {
+      throw new Error('Target bundle errors at top of block')
+    }
+    for (let currentBundleId = 0; currentBundleId < bundleCount; currentBundleId++) {
+      const currentBundleTransactions = [bundleTransactions[currentBundleId]]
+      const currentBundleSignedTxs = await Promise.all(
+        currentBundleTransactions.map(async (tx) => {
+          if (tx.raw !== undefined) {
+            return tx.raw
+          }
+          if (tx.v !== undefined && tx.r !== undefined && tx.s !== undefined) {
+            if (tx.type === 2) {
+              delete tx.gasPrice
+            }
+            return serialize(tx, {
+              v: tx.v,
+              r: tx.r,
+              s: tx.s
+            })
+          }
+          throw new Error('Could not get raw tx')
+        })
+      )
+      signedPriorBundleTransactions.push(...currentBundleSignedTxs)
+      const competitorAndTargetBundleSimulation = await this.simulate(
+        [...signedPriorBundleTransactions, ...targetSignedBundledTransactions],
+        targetBlockNumber,
+        targetBlockNumber - 1
+      )
+
+      if ('error' in competitorAndTargetBundleSimulation) {
+        if (competitorAndTargetBundleSimulation.error.message.startsWith('err: nonce too low:')) {
+          return {
+            conflictType: FlashbotsBundleConflictType.NonceCollision,
+            initialSimulation,
+            conflictingBundle: currentBundleTransactions
+          }
+        }
+        throw new Error('Simulation error')
+      }
+      const targetSimulation = competitorAndTargetBundleSimulation.results.slice(-targetSignedBundledTransactions.length)
+      for (let j = 0; j < targetSimulation.length; j++) {
+        const targetSimulationTx = targetSimulation[j]
+        const initialSimulationTx = initialSimulation.results[j]
+        if ('error' in targetSimulationTx || 'error' in initialSimulationTx) {
+          if ('error' in targetSimulationTx != 'error' in initialSimulationTx) {
+            return {
+              conflictType: FlashbotsBundleConflictType.Error,
+              initialSimulation,
+              conflictingBundle: currentBundleTransactions
+            }
+          }
+          continue
+        }
+        if (targetSimulationTx.ethSentToCoinbase != initialSimulationTx.ethSentToCoinbase) {
+          return {
+            conflictType: FlashbotsBundleConflictType.CoinbasePayment,
+            initialSimulation,
+            conflictingBundle: currentBundleTransactions
+          }
+        }
+        if (targetSimulationTx.gasUsed != initialSimulation.results[j].gasUsed) {
+          return {
+            conflictType: FlashbotsBundleConflictType.GasUsed,
+            initialSimulation,
+            conflictingBundle: currentBundleTransactions
+          }
+        }
+      }
+    }
+    return {
+      conflictType: FlashbotsBundleConflictType.NoConflict,
+      initialSimulation,
+      conflictingBundle: []
+    }
+  }
+
   public async getConflictingBundleWithoutGasPricing(
     targetSignedBundledTransactions: Array<string>,
     targetBlockNumber: number
@@ -745,7 +847,7 @@ export class FlashbotsBundleProvider extends providers.JsonRpcProvider {
           }
           if (tx.v !== undefined && tx.r !== undefined && tx.s !== undefined) {
             if (tx.type === 2) {
-              delete tx.gasPrice;
+              delete tx.gasPrice
             }
             return serialize(tx, {
               v: tx.v,
@@ -814,6 +916,10 @@ export class FlashbotsBundleProvider extends providers.JsonRpcProvider {
     return fetchJson(`https://blocks.flashbots.net/v1/blocks?block_number=${blockNumber}`)
   }
 
+  public async fetchBlocks(blockNumber: number): Promise<BlockWithTransactions> {
+    return this.genericProvider.getBlockWithTransactions(blockNumber)
+  }
+
   private async request(request: string) {
     const connectionInfo = { ...this.connectionInfo }
     connectionInfo.headers = {
@@ -828,7 +934,13 @@ export class FlashbotsBundleProvider extends providers.JsonRpcProvider {
   }
 
   private prepareRelayRequest(
-    method: 'eth_callBundle' | 'eth_sendBundle' | 'eth_sendPrivateTransaction' | 'eth_cancelPrivateTransaction' | 'flashbots_getUserStats' | 'flashbots_getBundleStats',
+    method:
+      | 'eth_callBundle'
+      | 'eth_sendBundle'
+      | 'eth_sendPrivateTransaction'
+      | 'eth_cancelPrivateTransaction'
+      | 'flashbots_getUserStats'
+      | 'flashbots_getBundleStats',
     params: RpcParams
   ) {
     return {
@@ -838,4 +950,9 @@ export class FlashbotsBundleProvider extends providers.JsonRpcProvider {
       jsonrpc: '2.0'
     }
   }
+}
+export interface FlashbotsTransactionConflict {
+  conflictingBundle: Array<TransactionResponse>
+  initialSimulation: SimulationResponseSuccess
+  conflictType: FlashbotsBundleConflictType
 }
