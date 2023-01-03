@@ -735,8 +735,12 @@ export class FlashbotsBundleProvider extends providers.JsonRpcProvider {
     const bundleTransactions = competingBundles.transactions
     const bundleCount = bundleTransactions.length
     const signedPriorBundleTransactions = []
-    if ('error' in initialSimulation || initialSimulation.firstRevert !== undefined) {
+    if ('error' in initialSimulation) {
+      console.log(initialSimulation.error)
       throw new Error('Target bundle errors at top of block')
+    }
+    if (initialSimulation.firstRevert !== undefined) {
+      throw new Error('First Revert')
     }
     for (let currentBundleId = 0; currentBundleId < bundleCount; currentBundleId++) {
       const currentBundleTransactions = [bundleTransactions[currentBundleId]]
@@ -823,8 +827,12 @@ export class FlashbotsBundleProvider extends providers.JsonRpcProvider {
     if (competingBundles.latest_block_number <= targetBlockNumber) {
       throw new Error('Blocks-api has not processed target block')
     }
-    if ('error' in initialSimulation || initialSimulation.firstRevert !== undefined) {
+    if ('error' in initialSimulation) {
+      console.log(initialSimulation.error)
       throw new Error('Target bundle errors at top of block')
+    }
+    if (initialSimulation.firstRevert !== undefined) {
+      throw new Error('First Revert undefined ')
     }
     const blockDetails = competingBundles.blocks[0]
     if (blockDetails === undefined) {
@@ -926,6 +934,8 @@ export class FlashbotsBundleProvider extends providers.JsonRpcProvider {
       'X-Flashbots-Signature': `${await this.authSigner.getAddress()}:${await this.authSigner.signMessage(id(request))}`,
       ...this.connectionInfo.headers
     }
+    console.log(connectionInfo)
+    console.log(request)
     return fetchJson(connectionInfo, request)
   }
 
@@ -940,7 +950,8 @@ export class FlashbotsBundleProvider extends providers.JsonRpcProvider {
       | 'eth_sendPrivateTransaction'
       | 'eth_cancelPrivateTransaction'
       | 'flashbots_getUserStats'
-      | 'flashbots_getBundleStats',
+      | 'flashbots_getBundleStats'
+      | 'eth_call',
     params: RpcParams
   ) {
     return {
